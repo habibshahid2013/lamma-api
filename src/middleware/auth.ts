@@ -18,6 +18,7 @@ export async function requireAuth(c: Context<AppEnv>, next: Next) {
   try {
     const decoded = await getAdminAuth().verifyIdToken(token);
     c.set('userId', decoded.uid);
+    c.set('userEmail', decoded.email ?? '');
     c.set('isAdmin', decoded.admin === true);
     await next();
   } catch {

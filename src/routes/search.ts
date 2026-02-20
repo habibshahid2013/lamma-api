@@ -286,10 +286,11 @@ searchRouter.get('/similar', rateLimitSearch, async (c) => {
       .map((doc: FirebaseFirestore.DocumentSnapshot) => {
         const data = doc.data()!;
         const distance = data._distance as number | undefined;
+        const creator = stripEmbedding(data);
+        delete creator._distance;
         return {
           id: doc.id,
-          name: data.name,
-          slug: data.slug,
+          ...creator,
           similarity: distance !== undefined ? 1 - distance : 0,
           distance,
         };

@@ -47,9 +47,11 @@ usersRouter.put('/me', zValidator('json', userCreateBody), async (c) => {
     return c.json({ user: existing.data(), created: false });
   }
 
+  const email = c.get('userEmail') as string;
+
   const newUser = {
     userId,
-    email: '', // filled from token in a future iteration
+    email,
     displayName: body.displayName,
     photoURL: body.photoURL ?? null,
     role: 'user',

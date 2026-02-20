@@ -633,17 +633,17 @@ describe('GET /search/similar', () => {
       {
         id: 'abc123', // same as source — should be filtered out
         exists: true,
-        data: () => ({ name: 'Source', slug: 'source', _distance: 0, is_published: true }),
+        data: () => ({ name: 'Source', slug: 'source', _distance: 0, is_published: true, embedding: [0.1] }),
       },
       {
         id: 'sim1',
         exists: true,
-        data: () => ({ name: 'Similar One', slug: 'sim-one', _distance: 0.15, is_published: true }),
+        data: () => ({ name: 'Similar One', slug: 'sim-one', _distance: 0.15, is_published: true, embedding: [0.2], categories: ['scholar'] }),
       },
       {
         id: 'sim2',
         exists: true,
-        data: () => ({ name: 'Similar Two', slug: 'sim-two', _distance: 0.25, is_published: true }),
+        data: () => ({ name: 'Similar Two', slug: 'sim-two', _distance: 0.25, is_published: true, embedding: [0.3], categories: ['educator'] }),
       },
     ];
     mockGet.mockResolvedValueOnce({ docs: knnDocs });
@@ -656,6 +656,10 @@ describe('GET /search/similar', () => {
     expect(body.results).toHaveLength(2);
     expect(body.results[0].id).toBe('sim1');
     expect(body.results[0].similarity).toBeCloseTo(0.85, 2);
+    expect(body.results[0].name).toBe('Similar One');
+    expect(body.results[0].categories).toEqual(['scholar']);
+    expect(body.results[0].embedding).toBeUndefined();
+    expect(body.results[0]._distance).toBeUndefined();
     expect(body.results[1].id).toBe('sim2');
     expect(mockFindNearest).toHaveBeenCalled();
   });

@@ -82,7 +82,7 @@ publicRouter.post(
       creatorProfileId: creatorId,
       creatorName,
       claimantUserId: userId,
-      claimantEmail: '', // populated from token in future iteration
+      claimantEmail: c.get('userEmail') ?? '',
       evidence: {
         method,
         socialMediaLinks: socialLinks ?? [],
