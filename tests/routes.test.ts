@@ -28,16 +28,19 @@ const mockOrderBy = vi.fn();
 const mockStartAt = vi.fn();
 const mockEndAt = vi.fn();
 const mockStartAfter = vi.fn();
+const mockFindNearest = vi.fn();
 
-const mockQueryChain = {
+const mockQueryChain: Record<string, unknown> = {
   where: mockWhere,
   limit: mockLimit,
+  select: mockSelect,
   get: mockGet,
   count: mockCount,
   orderBy: mockOrderBy,
   startAt: mockStartAt,
   endAt: mockEndAt,
   startAfter: mockStartAfter,
+  findNearest: mockFindNearest,
 };
 
 const mockCollection = vi.fn(() => ({
@@ -52,11 +55,12 @@ const mockCollection = vi.fn(() => ({
 
 mockWhere.mockReturnValue(mockQueryChain);
 mockLimit.mockReturnValue({ get: mockGet });
-mockSelect.mockReturnValue({ get: mockGet });
+mockSelect.mockReturnValue({ get: mockGet, limit: mockLimit });
 mockOrderBy.mockReturnValue(mockQueryChain);
 mockStartAt.mockReturnValue(mockQueryChain);
 mockEndAt.mockReturnValue(mockQueryChain);
 mockStartAfter.mockReturnValue(mockQueryChain);
+mockFindNearest.mockReturnValue({ get: mockGet });
 mockCount.mockReturnValue({ get: vi.fn().mockResolvedValue({ data: () => ({ count: 5 }) }) });
 mockDoc.mockReturnValue({
   get: mockGet,
@@ -86,6 +90,32 @@ vi.mock('../src/lib/firebase.js', () => ({
 vi.mock('../src/lib/redis.js', () => ({
   redis: null,
 }));
+
+// Mock FieldValue from firebase-admin/firestore
+vi.mock('firebase-admin/firestore', () => ({
+  FieldValue: {
+    vector: (arr: number[]) => ({ _vectorValue: arr }),
+    serverTimestamp: () => ({ _serverTimestamp: true }),
+    arrayUnion: (...items: unknown[]) => ({ _arrayUnion: items }),
+    arrayRemove: (...items: unknown[]) => ({ _arrayRemove: items }),
+    increment: (n: number) => ({ _increment: n }),
+    delete: () => ({ _delete: true }),
+  },
+}));
+
+// Mock Voyage AI embedder
+const mockEmbedQuery = vi.fn();
+vi.mock('../src/services/voyage-embedder.js', () => ({
+  embedQuery: (...args: unknown[]) => mockEmbedQuery(...args),
+}));
+
+// Mock keyword search service
+const mockKeywordSearch = vi.fn();
+vi.mock('../src/services/keyword-search.js', () => ({
+  keywordSearch: (...args: unknown[]) => mockKeywordSearch(...args),
+}));
+
+// findNearest mock default return value is set above with other chain mocks
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -533,7 +563,18 @@ describe('POST /users/me/following', () => {
 // ---------------------------------------------------------------------------
 
 describe('GET /search/similar', () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockCollection.mockImplementation(() => ({
+      where: mockWhere,
+      limit: mockLimit,
+      select: mockSelect,
+      doc: mockDoc,
+      get: mockGet,
+      add: mockAdd,
+      orderBy: mockOrderBy,
+    }));
+  });
 
   it('returns precomputed similar creators', async () => {
     const creatorDocGet = vi.fn().mockResolvedValue({
@@ -562,8 +603,285 @@ describe('GET /search/similar', () => {
     expect(body.results).toHaveLength(2);
   });
 
+  it('uses live KNN when embedding exists but no precomputed data', async () => {
+    const mockDocUpdate = vi.fn().mockResolvedValue(undefined);
+    const creatorDocGet = vi.fn().mockResolvedValue({
+      exists: true,
+      data: () => ({
+        name: 'Source Creator',
+        embedding: [0.1, 0.2, 0.3],
+        categories: ['scholar'],
+        is_published: true,
+      }),
+    });
+
+    mockCollection.mockImplementation(() => ({
+      doc: (id: string) => ({
+        get: id ? creatorDocGet : mockGet,
+        update: mockDocUpdate,
+        set: vi.fn(),
+      }),
+      where: mockWhere,
+      limit: mockLimit,
+      get: mockGet,
+      add: mockAdd,
+      findNearest: mockFindNearest,
+    }));
+
+    // findNearest returns KNN results (is_published needed for post-filter)
+    const knnDocs = [
+      {
+        id: 'abc123', // same as source — should be filtered out
+        exists: true,
+        data: () => ({ name: 'Source', slug: 'source', _distance: 0, is_published: true }),
+      },
+      {
+        id: 'sim1',
+        exists: true,
+        data: () => ({ name: 'Similar One', slug: 'sim-one', _distance: 0.15, is_published: true }),
+      },
+      {
+        id: 'sim2',
+        exists: true,
+        data: () => ({ name: 'Similar Two', slug: 'sim-two', _distance: 0.25, is_published: true }),
+      },
+    ];
+    mockGet.mockResolvedValueOnce({ docs: knnDocs });
+
+    const res = await app.request('/search/similar?creatorId=abc123');
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.fallback).toBe(false);
+    expect(body.results).toHaveLength(2);
+    expect(body.results[0].id).toBe('sim1');
+    expect(body.results[0].similarity).toBeCloseTo(0.85, 2);
+    expect(body.results[1].id).toBe('sim2');
+    expect(mockFindNearest).toHaveBeenCalled();
+  });
+
+  it('falls back to category matching when no embedding', async () => {
+    const creatorDocGet = vi.fn().mockResolvedValue({
+      exists: true,
+      data: () => ({
+        name: 'No Embed',
+        categories: ['scholar'],
+        is_published: true,
+        // No embedding field
+      }),
+    });
+
+    mockCollection.mockImplementation(() => ({
+      doc: () => ({ get: creatorDocGet, update: vi.fn(), set: vi.fn() }),
+      where: mockWhere,
+      limit: mockLimit,
+      get: mockGet,
+      add: mockAdd,
+    }));
+
+    const catDocs = [
+      makeCreatorDoc('cat1'),
+      makeCreatorDoc('cat2'),
+    ];
+    mockGet.mockResolvedValueOnce({ docs: catDocs });
+
+    const res = await app.request('/search/similar?creatorId=abc123');
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.fallback).toBe(true);
+    expect(body.results.length).toBeGreaterThanOrEqual(1);
+    expect(mockFindNearest).not.toHaveBeenCalled();
+  });
+
   it('returns 400 without creatorId', async () => {
     const res = await app.request('/search/similar');
+    expect(res.status).toBe(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /search — Hybrid search
+// ---------------------------------------------------------------------------
+
+describe('POST /search', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    // Re-establish mock chain after clearAllMocks (previous test groups
+    // may have overridden mockCollection with different shapes).
+    mockWhere.mockReturnValue(mockQueryChain);
+    mockLimit.mockReturnValue({ get: mockGet });
+    mockSelect.mockReturnValue({ get: mockGet, limit: mockLimit });
+    mockOrderBy.mockReturnValue(mockQueryChain);
+    mockStartAt.mockReturnValue(mockQueryChain);
+    mockEndAt.mockReturnValue(mockQueryChain);
+    mockStartAfter.mockReturnValue(mockQueryChain);
+    mockFindNearest.mockReturnValue({ get: mockGet });
+    mockDoc.mockReturnValue({ get: mockGet, update: mockUpdate, set: vi.fn() });
+
+    mockCollection.mockImplementation(() => ({
+      where: mockWhere,
+      limit: mockLimit,
+      select: mockSelect,
+      doc: mockDoc,
+      get: mockGet,
+      add: mockAdd,
+      orderBy: mockOrderBy,
+      findNearest: mockFindNearest,
+    }));
+  });
+
+  it('performs keyword-only search', async () => {
+    const docs = [
+      makeCreatorDoc('k1', { name: 'Islamic Scholar', topics: ['islam'] }),
+      makeCreatorDoc('k2', { name: 'Cooking Chef', topics: ['cooking'] }),
+    ];
+    mockGet.mockResolvedValueOnce({ docs });
+
+    mockKeywordSearch.mockReturnValueOnce([
+      { id: 'k1', score: 0.9 },
+    ]);
+
+    const res = await app.request('/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: 'islamic', mode: 'keyword', limit: 10 }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.results).toHaveLength(1);
+    expect(body.results[0].id).toBe('k1');
+    expect(body.results[0].combinedScore).toBe(0.9);
+    expect(body.meta.mode).toBe('keyword');
+    expect(mockEmbedQuery).not.toHaveBeenCalled();
+    expect(mockKeywordSearch).toHaveBeenCalled();
+  });
+
+  it('performs semantic-only search using findNearest', async () => {
+    mockEmbedQuery.mockResolvedValueOnce([0.5, 0.6, 0.7]);
+
+    const knnDocs = [
+      {
+        id: 's1',
+        exists: true,
+        data: () => ({
+          name: 'Semantic Match',
+          slug: 'semantic-match',
+          _distance: 0.2,
+          embedding: [0.1, 0.2],
+          is_published: true,
+        }),
+      },
+    ];
+    mockGet.mockResolvedValueOnce({ docs: knnDocs });
+
+    const res = await app.request('/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: 'islamic history', mode: 'semantic', limit: 10 }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.results).toHaveLength(1);
+    expect(body.results[0].id).toBe('s1');
+    expect(body.results[0].semanticScore).toBeCloseTo(0.8, 2);
+    expect(body.results[0].creator.embedding).toBeUndefined();
+    expect(body.meta.mode).toBe('semantic');
+    expect(mockEmbedQuery).toHaveBeenCalledWith('islamic history');
+    expect(mockFindNearest).toHaveBeenCalled();
+  });
+
+  it('performs hybrid search merging semantic + keyword', async () => {
+    // Semantic results
+    mockEmbedQuery.mockResolvedValueOnce([0.5, 0.6, 0.7]);
+    const knnDocs = [
+      {
+        id: 'h1',
+        exists: true,
+        data: () => ({
+          name: 'Both Match',
+          slug: 'both',
+          _distance: 0.1,
+          embedding: [0.1],
+          is_published: true,
+        }),
+      },
+      {
+        id: 'h2',
+        exists: true,
+        data: () => ({
+          name: 'Semantic Only',
+          slug: 'sem-only',
+          _distance: 0.3,
+          embedding: [0.2],
+          is_published: true,
+        }),
+      },
+    ];
+    mockGet
+      .mockResolvedValueOnce({ docs: knnDocs }) // findNearest result
+      .mockResolvedValueOnce({ docs: [makeCreatorDoc('h1'), makeCreatorDoc('h3')] }); // keyword fetch
+
+    mockKeywordSearch.mockReturnValueOnce([
+      { id: 'h1', score: 0.8 },
+      { id: 'h3', score: 0.6 },
+    ]);
+
+    const res = await app.request('/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query: 'scholar',
+        mode: 'hybrid',
+        limit: 10,
+        semanticWeight: 0.7,
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    // h1 should be first (appears in both semantic and keyword)
+    expect(body.results[0].id).toBe('h1');
+    expect(body.results[0].semanticScore).toBeGreaterThan(0);
+    expect(body.results[0].keywordScore).toBeGreaterThan(0);
+    // h2 and h3 should also be present
+    const ids = body.results.map((r: { id: string }) => r.id);
+    expect(ids).toContain('h2');
+    expect(ids).toContain('h3');
+  });
+
+  it('falls back to keyword-only when semantic fails in hybrid mode', async () => {
+    mockEmbedQuery.mockRejectedValueOnce(new Error('Voyage API down'));
+
+    const docs = [makeCreatorDoc('f1', { name: 'Fallback' })];
+    mockGet.mockResolvedValueOnce({ docs });
+
+    mockKeywordSearch.mockReturnValueOnce([
+      { id: 'f1', score: 0.7 },
+    ]);
+
+    const res = await app.request('/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: 'fallback test', mode: 'hybrid', limit: 5 }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.results).toHaveLength(1);
+    expect(body.results[0].id).toBe('f1');
+  });
+
+  it('rejects query shorter than 2 characters', async () => {
+    const res = await app.request('/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: 'a' }),
+    });
     expect(res.status).toBe(400);
   });
 });
