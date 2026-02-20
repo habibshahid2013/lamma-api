@@ -5,7 +5,7 @@ import { getDb } from '../lib/firebase.js';
 import { rateLimitSearch } from '../middleware/rate-limit.js';
 import { semanticSearchBody, similarQuery } from '../schemas/search.js';
 import { embedQuery } from '../services/voyage-embedder.js';
-import { keywordSearch } from '../services/keyword-search.js';
+import { keywordSearchCached } from '../services/keyword-search.js';
 import type { AppEnv } from '../types/env.js';
 
 export const searchRouter = new Hono<AppEnv>();
@@ -99,60 +99,22 @@ searchRouter.post(
     }
 
     // ---------- Keyword Search ----------
+    // Uses the cached creator index (in-memory + Redis) so every keyword
+    // search covers ALL published creators, not just a limited Firestore fetch.
     const keywordResults: Map<string, number> = new Map();
-    let allCreatorsMap: Map<string, Record<string, unknown>> = new Map();
+    const allCreatorsMap: Map<string, Record<string, unknown>> = new Map();
 
     if (mode === 'keyword' || mode === 'hybrid') {
-      // Fetch published creators for Fuse.js — use select() to avoid pulling
-      // large embedding arrays and other heavy fields over the wire.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      let q: any = db.collection('creators').where('is_published', '==', true);
+      const kwResults = await keywordSearchCached(query, limit * 2, {
+        category: filters.category,
+        region: filters.region,
+        language: filters.language,
+        gender: filters.gender,
+      });
 
-      // Apply filters that don't conflict with array-contains
-      if (filters.category) q = q.where('categories', 'array-contains', filters.category);
-      if (filters.region) q = q.where('region', '==', filters.region);
-      if (filters.gender) q = q.where('gender', '==', filters.gender);
-      // Language post-filtered if category is also set
-
-      const snapshot = await q
-        .select(
-          'name',
-          'slug',
-          'categories',
-          'category',
-          'topics',
-          'region',
-          'languages',
-          'gender',
-          'is_published',
-          'profile',
-        )
-        .limit(50)
-        .get();
-
-      let creators = snapshot.docs.map(
-        (doc: FirebaseFirestore.DocumentSnapshot) => {
-          const data = doc.data()!;
-          return { id: doc.id, ...data };
-        },
-      );
-
-      // Post-filter language when category already consumed array-contains
-      if (filters.language && filters.category) {
-        creators = creators.filter((c: Record<string, unknown>) => {
-          const langs = Array.isArray(c.languages) ? c.languages : [];
-          return langs.includes(filters.language!);
-        });
-      }
-
-      // Store for merged result building
-      for (const c of creators) {
-        allCreatorsMap.set(c.id as string, c as Record<string, unknown>);
-      }
-
-      const kwResults = keywordSearch(creators, query, limit * 2);
       for (const r of kwResults) {
         keywordResults.set(r.id, r.score);
+        allCreatorsMap.set(r.id, r.creator as unknown as Record<string, unknown>);
       }
     }
 

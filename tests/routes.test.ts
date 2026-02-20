@@ -109,10 +109,19 @@ vi.mock('../src/services/voyage-embedder.js', () => ({
   embedQuery: (...args: unknown[]) => mockEmbedQuery(...args),
 }));
 
-// Mock keyword search service
+// Mock keyword search service (cached version used by search route)
+const mockKeywordSearchCached = vi.fn();
 const mockKeywordSearch = vi.fn();
 vi.mock('../src/services/keyword-search.js', () => ({
+  keywordSearchCached: (...args: unknown[]) => mockKeywordSearchCached(...args),
   keywordSearch: (...args: unknown[]) => mockKeywordSearch(...args),
+}));
+
+// Mock creator-cache (imported by keyword-search)
+vi.mock('../src/services/creator-cache.js', () => ({
+  getCachedCreators: vi.fn().mockResolvedValue([]),
+  filterCreators: vi.fn((creators: unknown[]) => creators),
+  invalidateCache: vi.fn(),
 }));
 
 // findNearest mock default return value is set above with other chain mocks
@@ -737,14 +746,8 @@ describe('POST /search', () => {
   });
 
   it('performs keyword-only search', async () => {
-    const docs = [
-      makeCreatorDoc('k1', { name: 'Islamic Scholar', topics: ['islam'] }),
-      makeCreatorDoc('k2', { name: 'Cooking Chef', topics: ['cooking'] }),
-    ];
-    mockGet.mockResolvedValueOnce({ docs });
-
-    mockKeywordSearch.mockReturnValueOnce([
-      { id: 'k1', score: 0.9 },
+    mockKeywordSearchCached.mockResolvedValueOnce([
+      { id: 'k1', score: 0.9, creator: { id: 'k1', name: 'Islamic Scholar', slug: 'islamic-scholar', categories: ['scholar'], topics: ['islam'] } },
     ]);
 
     const res = await app.request('/search', {
@@ -760,7 +763,7 @@ describe('POST /search', () => {
     expect(body.results[0].combinedScore).toBe(0.9);
     expect(body.meta.mode).toBe('keyword');
     expect(mockEmbedQuery).not.toHaveBeenCalled();
-    expect(mockKeywordSearch).toHaveBeenCalled();
+    expect(mockKeywordSearchCached).toHaveBeenCalled();
   });
 
   it('performs semantic-only search using findNearest', async () => {
@@ -825,13 +828,11 @@ describe('POST /search', () => {
         }),
       },
     ];
-    mockGet
-      .mockResolvedValueOnce({ docs: knnDocs }) // findNearest result
-      .mockResolvedValueOnce({ docs: [makeCreatorDoc('h1'), makeCreatorDoc('h3')] }); // keyword fetch
+    mockGet.mockResolvedValueOnce({ docs: knnDocs }); // findNearest result
 
-    mockKeywordSearch.mockReturnValueOnce([
-      { id: 'h1', score: 0.8 },
-      { id: 'h3', score: 0.6 },
+    mockKeywordSearchCached.mockResolvedValueOnce([
+      { id: 'h1', score: 0.8, creator: { id: 'h1', name: 'Both Match', slug: 'both', categories: ['scholar'], topics: [] } },
+      { id: 'h3', score: 0.6, creator: { id: 'h3', name: 'Keyword Only', slug: 'kw-only', categories: ['scholar'], topics: [] } },
     ]);
 
     const res = await app.request('/search', {
@@ -861,11 +862,8 @@ describe('POST /search', () => {
   it('falls back to keyword-only when semantic fails in hybrid mode', async () => {
     mockEmbedQuery.mockRejectedValueOnce(new Error('Voyage API down'));
 
-    const docs = [makeCreatorDoc('f1', { name: 'Fallback' })];
-    mockGet.mockResolvedValueOnce({ docs });
-
-    mockKeywordSearch.mockReturnValueOnce([
-      { id: 'f1', score: 0.7 },
+    mockKeywordSearchCached.mockResolvedValueOnce([
+      { id: 'f1', score: 0.7, creator: { id: 'f1', name: 'Fallback', slug: 'fallback', categories: [], topics: [] } },
     ]);
 
     const res = await app.request('/search', {
