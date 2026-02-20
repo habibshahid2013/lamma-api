@@ -44,7 +44,7 @@ export const creatorsListQuery = z.object({
   limit: z
     .string()
     .transform(Number)
-    .pipe(z.number().int().min(1).max(100))
+    .pipe(z.number().int().min(1).max(500))
     .optional(),
   cursor: docId.optional(),
   contentType: z.enum(['youtube', 'podcast', 'books', 'courses', '']).optional(),
