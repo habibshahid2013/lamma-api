@@ -24,6 +24,21 @@ const mockUpdate = vi.fn();
 const mockBatchUpdate = vi.fn();
 const mockBatchCommit = vi.fn();
 const mockCount = vi.fn();
+const mockOrderBy = vi.fn();
+const mockStartAt = vi.fn();
+const mockEndAt = vi.fn();
+const mockStartAfter = vi.fn();
+
+const mockQueryChain = {
+  where: mockWhere,
+  limit: mockLimit,
+  get: mockGet,
+  count: mockCount,
+  orderBy: mockOrderBy,
+  startAt: mockStartAt,
+  endAt: mockEndAt,
+  startAfter: mockStartAfter,
+};
 
 const mockCollection = vi.fn(() => ({
   where: mockWhere,
@@ -32,16 +47,16 @@ const mockCollection = vi.fn(() => ({
   doc: mockDoc,
   get: mockGet,
   add: mockAdd,
+  orderBy: mockOrderBy,
 }));
 
-mockWhere.mockReturnValue({
-  where: mockWhere,
-  limit: mockLimit,
-  get: mockGet,
-  count: mockCount,
-});
+mockWhere.mockReturnValue(mockQueryChain);
 mockLimit.mockReturnValue({ get: mockGet });
 mockSelect.mockReturnValue({ get: mockGet });
+mockOrderBy.mockReturnValue(mockQueryChain);
+mockStartAt.mockReturnValue(mockQueryChain);
+mockEndAt.mockReturnValue(mockQueryChain);
+mockStartAfter.mockReturnValue(mockQueryChain);
 mockCount.mockReturnValue({ get: vi.fn().mockResolvedValue({ data: () => ({ count: 5 }) }) });
 mockDoc.mockReturnValue({
   get: mockGet,
@@ -239,6 +254,210 @@ describe('POST /creators/by-ids', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ids: [] }),
     });
+    expect(res.status).toBe(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Creators — Cursor pagination
+// ---------------------------------------------------------------------------
+
+describe('GET /creators with cursor', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Restore default mock chain (overridden by by-slug's mockImplementation)
+    mockCollection.mockImplementation(() => ({
+      where: mockWhere,
+      limit: mockLimit,
+      select: mockSelect,
+      doc: mockDoc,
+      get: mockGet,
+      add: mockAdd,
+      orderBy: mockOrderBy,
+    }));
+  });
+
+  it('returns nextCursor when more results exist', async () => {
+    const docs = [makeCreatorDoc('a1'), makeCreatorDoc('b2'), makeCreatorDoc('c3')];
+    // Order: cursor doc lookup first, then main query
+    mockGet
+      .mockResolvedValueOnce({ exists: true, data: () => ({ name: 'A' }) })
+      .mockResolvedValueOnce({ docs });
+
+    const res = await app.request('/creators?limit=2&cursor=a0');
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.creators).toHaveLength(2);
+    expect(body.nextCursor).toBe('b2');
+    expect(mockOrderBy).toHaveBeenCalledWith('name');
+    expect(mockStartAfter).toHaveBeenCalled();
+  });
+
+  it('returns null nextCursor when no more results', async () => {
+    const docs = [makeCreatorDoc('a1')];
+    mockGet
+      .mockResolvedValueOnce({ exists: true, data: () => ({ name: 'A' }) })
+      .mockResolvedValueOnce({ docs });
+
+    const res = await app.request('/creators?limit=2&cursor=a0');
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.creators).toHaveLength(1);
+    expect(body.nextCursor).toBeNull();
+  });
+
+  it('filters by contentType post-query', async () => {
+    const docs = [
+      makeCreatorDoc('a1', { content: { youtube: ['vid1'] } }),
+      makeCreatorDoc('b2', { content: { podcast: ['ep1'] } }),
+      makeCreatorDoc('c3', { content: { youtube: ['vid2'] } }),
+    ];
+    mockGet.mockResolvedValueOnce({ docs });
+
+    const res = await app.request('/creators?contentType=youtube');
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.creators).toHaveLength(2);
+    expect(body.creators[0].id).toBe('a1');
+    expect(body.creators[1].id).toBe('c3');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Creators — Slugs
+// ---------------------------------------------------------------------------
+
+describe('GET /creators/slugs', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockCollection.mockImplementation(() => ({
+      where: mockWhere,
+      limit: mockLimit,
+      select: mockSelect,
+      doc: mockDoc,
+      get: mockGet,
+      add: mockAdd,
+      orderBy: mockOrderBy,
+    }));
+  });
+
+  it('returns slug IDs from the slugs collection', async () => {
+    const docs = [
+      { id: 'ahmed-hasan', exists: true, data: () => ({ creatorId: 'x1' }) },
+      { id: 'sara-ali', exists: true, data: () => ({ creatorId: 'x2' }) },
+    ];
+    mockGet.mockResolvedValueOnce({ docs });
+
+    const res = await app.request('/creators/slugs');
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.slugs).toEqual(['ahmed-hasan', 'sara-ali']);
+    expect(body.total).toBe(2);
+    expect(mockCollection).toHaveBeenCalledWith('slugs');
+  });
+
+  it('respects limit parameter', async () => {
+    mockGet.mockResolvedValueOnce({ docs: [] });
+
+    await app.request('/creators/slugs?limit=5');
+    expect(mockLimit).toHaveBeenCalledWith(5);
+  });
+
+  it('rejects invalid limit', async () => {
+    const res = await app.request('/creators/slugs?limit=abc');
+    expect(res.status).toBe(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Creators — Search by name
+// ---------------------------------------------------------------------------
+
+describe('GET /creators/search-by-name', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockCollection.mockImplementation(() => ({
+      where: mockWhere,
+      limit: mockLimit,
+      select: mockSelect,
+      doc: mockDoc,
+      get: mockGet,
+      add: mockAdd,
+      orderBy: mockOrderBy,
+    }));
+  });
+
+  it('returns matching creators by name prefix', async () => {
+    const docs = [
+      {
+        id: 'x1',
+        exists: true,
+        data: () => ({
+          name: 'Ahmed Hasan',
+          slug: 'ahmed-hasan',
+          avatar: 'https://img.example.com/ahmed.jpg',
+          categories: ['scholar'],
+          location: 'Cairo',
+          is_published: true,
+        }),
+      },
+    ];
+    mockGet.mockResolvedValueOnce({ docs });
+
+    const res = await app.request('/creators/search-by-name?q=ahmed');
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.results).toHaveLength(1);
+    expect(body.results[0].name).toBe('Ahmed Hasan');
+    expect(body.results[0].slug).toBe('ahmed-hasan');
+    expect(mockOrderBy).toHaveBeenCalledWith('name');
+    expect(mockStartAt).toHaveBeenCalledWith('Ahmed');
+  });
+
+  it('excludes claimed creators (with ownerId)', async () => {
+    const docs = [
+      {
+        id: 'x1',
+        exists: true,
+        data: () => ({
+          name: 'Ahmed',
+          slug: 'ahmed',
+          categories: [],
+          is_published: true,
+        }),
+      },
+      {
+        id: 'x2',
+        exists: true,
+        data: () => ({
+          name: 'Ahmed K',
+          slug: 'ahmed-k',
+          categories: [],
+          is_published: true,
+          ownerId: 'user-123',
+        }),
+      },
+    ];
+    mockGet.mockResolvedValueOnce({ docs });
+
+    const res = await app.request('/creators/search-by-name?q=ahmed');
+    const body = await res.json();
+    expect(body.results).toHaveLength(1);
+    expect(body.results[0].id).toBe('x1');
+  });
+
+  it('rejects query shorter than 2 characters', async () => {
+    const res = await app.request('/creators/search-by-name?q=a');
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects missing query', async () => {
+    const res = await app.request('/creators/search-by-name');
     expect(res.status).toBe(400);
   });
 });

@@ -46,6 +46,8 @@ export const creatorsListQuery = z.object({
     .transform(Number)
     .pipe(z.number().int().min(1).max(100))
     .optional(),
+  cursor: docId.optional(),
+  contentType: z.enum(['youtube', 'podcast', 'books', 'courses', '']).optional(),
 });
 
 export type CreatorsListQuery = z.infer<typeof creatorsListQuery>;
@@ -60,4 +62,16 @@ export const slugParam = z.object({
 
 export const byIdsBody = z.object({
   ids: z.array(docId).min(1).max(50),
+});
+
+export const slugsQuery = z.object({
+  limit: z
+    .string()
+    .transform(Number)
+    .pipe(z.number().int().min(1).max(500))
+    .optional(),
+});
+
+export const searchByNameQuery = z.object({
+  q: z.string().min(2).max(100).trim(),
 });
